@@ -43,3 +43,4 @@ java/build/**
 application-*.properties
 
 .claude/
+CLAUDE.md
