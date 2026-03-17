@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Runner's High</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            neon: '#39FF14',
+            dark: { 900:'#0a0a0a', 800:'#111111', 700:'#1a1a1a', 600:'#222222', 500:'#2a2a2a' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0a0a; color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      display: flex; justify-content: center; min-height: 100vh;
+    }
+    #root { width: 100%; max-width: 430px; background: #111111; min-height: 100vh; position: relative; }
+    .fade-enter { animation: fadeIn 0.2s ease-in-out; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+    .toast-enter { animation: toastIn 0.3s ease-out; }
+    @keyframes toastIn { from { opacity:0; transform:translateX(-50%) translateY(20px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
+    .kakao-fallback { background:#1a2a1a; display:flex; align-items:center; justify-content:center; }
+    input:-webkit-autofill { -webkit-box-shadow:0 0 0 1000px #1a1a1a inset; -webkit-text-fill-color:#fff; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+  const { useState, useEffect, useRef, useCallback } = React;
+
+  /* ══════════════════════════════════════════
+     API Layer — 모든 서버 통신을 여기서 처리
+  ══════════════════════════════════════════ */
+  const API_BASE = '/api/v1';
+
+  async function apiFetch(path, options = {}) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json', ...options.headers },
+      ...options,
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error?.message || '서버 오류가 발생했습니다.');
+    return json.data;
+  }
+
+  const api = {
+    // Member
+    register: (body) => apiFetch('/members', { method: 'POST', body }),
+    login:    (body) => apiFetch('/auth/login', { method: 'POST', body }),
+    getMe:    (id)   => apiFetch(`/members/${id}`),
+    updateNickname: (id, nickname) => apiFetch(`/members/${id}`, { method: 'PUT', body: { nickname } }),
+
+    // Course
+    getCourses:        (region)    => apiFetch(region ? `/courses?region=${encodeURIComponent(region)}` : '/courses'),
+    getMyCourses:      (memberId)  => apiFetch(`/courses/members/${memberId}`),
+    saveCourse:        (body)      => apiFetch('/courses', { method: 'POST', body }),
+    likeCourse:        (id)        => apiFetch(`/courses/${id}/likes`, { method: 'POST' }),
+
+    // Run
+    createRun: (body) => apiFetch('/runs', { method: 'POST', body }),
+    getMyRuns:  (memberId) => apiFetch(`/runs/members/${memberId}`),
+  };
+
+  /* ══════════════════════════════════════════
+     Kakao Maps Loader
+  ══════════════════════════════════════════ */
+  function loadKakaoMaps() {
+    return new Promise((resolve, reject) => {
+      if (window.kakao?.maps) { resolve(window.kakao.maps); return; }
+      const s = document.createElement('script');
+      s.src = 'https://dapi.kakao.com/v2/maps/sdk.js?appkey=8802dbd9f32ffc3ee57a38d191cd0c1d&autoload=false';
+      s.onload = () => {
+        try {
+          // window.kakao가 없으면 API 키 미등록 or 도메인 미허용
+          if (!window.kakao || !window.kakao.maps) {
+            reject(new Error('Kakao Maps 초기화 실패 — 카카오 개발자 콘솔에서 localhost:8080 도메인을 등록하세요'));
+            return;
+          }
+          window.kakao.maps.load(() => resolve(window.kakao.maps));
+        } catch (e) {
+          reject(e);
+        }
+      };
+      s.onerror = () => reject(new Error('Kakao Maps 스크립트 로드 실패 — 네트워크 또는 API 키를 확인하세요'));
+      document.head.appendChild(s);
+    });
+  }
+
+  /* ══════════════════════════════════════════
+     Haversine — 두 좌표 간 거리(km) 계산
+  ══════════════════════════════════════════ */
+  function haversine(lat1, lng1, lat2, lng2) {
+    const R = 6371, toRad = d => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  function calcTotalDistance(waypoints) {
+    let d = 0;
+    for (let i = 1; i < waypoints.length; i++)
+      d += haversine(waypoints[i-1].lat, waypoints[i-1].lng, waypoints[i].lat, waypoints[i].lng);
+    return Math.round(d * 10) / 10;
+  }
+
+  /* ══════════════════════════════════════════
+     Medal Calculation — 조건 충족 시 자동 부여
+  ══════════════════════════════════════════ */
+  function calcMedals(member, myCourses) {
+    const medals = [];
+    const totalLikes = myCourses.reduce((s, c) => s + c.likes, 0);
+    const dist = member?.totalDistance ?? 0;
+    const regions = [...new Set(myCourses.map(c => c.region).filter(Boolean))];
+
+    if (dist >= 10)              medals.push({ id:'bronze',  icon:'🥉', name:'Bronze Runner',   desc:'10km 달성' });
+    if (dist >= 50)              medals.push({ id:'silver',  icon:'🥈', name:'Silver Runner',   desc:'50km 달성' });
+    if (dist >= 100)             medals.push({ id:'gold',    icon:'🥇', name:'Gold Runner',     desc:'100km 달성' });
+    if (myCourses.length >= 3)   medals.push({ id:'creator', icon:'🗺️', name:'Course Creator',  desc:'코스 3개 생성' });
+    if (regions.length >= 5)     medals.push({ id:'explorer',icon:'🧭', name:'Course Explorer', desc:'5개 지역 코스' });
+    if (totalLikes >= 50)        medals.push({ id:'legend',  icon:'⭐', name:'Running Legend',  desc:'좋아요 50개' });
+    return medals;
+  }
+
+  /* ══════════════════════════════════════════
+     공통 컴포넌트
+  ══════════════════════════════════════════ */
+
+  function Toast({ message, onDone }) {
+    useEffect(() => {
+      const t = setTimeout(onDone, 2500);
+      return () => clearTimeout(t);
+    }, []);
+    return (
+      <div className="fixed bottom-24 left-1/2 z-50 toast-enter" style={{ transform:'translateX(-50%)', maxWidth:300 }}>
+        <div className="bg-dark-600 border border-neon text-neon px-4 py-2 rounded-full text-sm font-medium shadow-lg whitespace-nowrap">
+          {message}
+        </div>
+      </div>
+    );
+  }
+
+  function Spinner() {
+    return (
+      <div className="flex items-center justify-center p-8">
+        <div className="w-6 h-6 border-2 border-neon border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  /* ──────────────────────────────────────────
+     MapComponent — 카카오맵 렌더러 (공유)
+     - onMapClick: 지도 클릭 시 { lat, lng } 전달
+     - onMapReady: (map, maps) API 인스턴스 전달
+  ────────────────────────────────────────── */
+  function MapComponent({ mapId, center, onMapClick, onMapReady, style }) {
+    const ref = useRef(null);
+    const [fallback, setFallback] = useState(false);
+
+    useEffect(() => {
+      let cancelled = false;
+      loadKakaoMaps()
+        .then(maps => {
+          if (cancelled || !ref.current) return;
+          const map = new maps.Map(ref.current, {
+            center: new maps.LatLng(center.lat, center.lng),
+            level: 4,
+          });
+          if (onMapReady) onMapReady(map, maps);
+          if (onMapClick) {
+            maps.event.addListener(map, 'click', e => {
+              const ll = e.latLng;
+              onMapClick({ lat: ll.getLat(), lng: ll.getLng() });
+            });
+          }
+        })
+        .catch(() => { if (!cancelled) setFallback(true); });
+      return () => { cancelled = true; };
+    }, []);
+
+    if (fallback) {
+      return (
+        <div ref={ref} className="kakao-fallback" style={style}
+          onClick={e => {
+            if (!onMapClick) return;
+            const r = e.currentTarget.getBoundingClientRect();
+            onMapClick({
+              lat: 37.5665 + (0.5 - (e.clientY - r.top) / r.height) * 0.1,
+              lng: 126.9780 + ((e.clientX - r.left) / r.width - 0.5) * 0.1,
+            });
+          }}>
+          <span className="text-neon text-xs opacity-60">지도 로드 실패 — 탭하여 좌표 추가</span>
+        </div>
+      );
+    }
+    return <div ref={ref} id={mapId} style={style} />;
+  }
+
+  /* ══════════════════════════════════════════
+     AuthScreen — 로그인 / 회원가입
+  ══════════════════════════════════════════ */
+  function AuthScreen({ onAuth, showToast }) {
+    const [tab, setTab]           = useState('login');   // 'login' | 'register'
+    const [form, setForm]         = useState({ nickname:'', email:'', password:'' });
+    const [loading, setLoading]   = useState(false);
+
+    const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+    const handleLogin = async () => {
+      if (!form.email || !form.password) { showToast('이메일과 비밀번호를 입력하세요'); return; }
+      setLoading(true);
+      try {
+        const member = await api.login({ email: form.email, password: form.password });
+        onAuth(member);
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    const handleRegister = async () => {
+      if (!form.nickname || !form.email || !form.password) { showToast('모든 항목을 입력하세요'); return; }
+      setLoading(true);
+      try {
+        // 회원가입 후 자동 로그인 (JWT 쿠키 발급 + member 정보 수신)
+        await api.register({ nickname: form.nickname, email: form.email, password: form.password });
+        const member = await api.login({ email: form.email, password: form.password });
+        onAuth(member);
+        showToast('회원가입이 완료됐습니다 🎉');
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    const inputCls = "w-full bg-dark-700 border border-dark-500 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-neon";
+
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen p-6 fade-enter">
+        {/* Logo */}
+        <div className="mb-8 text-center">
+          <div className="text-5xl mb-3">🏃</div>
+          <h1 className="text-2xl font-bold text-neon tracking-tight">Runner's High</h1>
+          <p className="text-gray-500 text-xs mt-1">러닝 코스를 그리고, 나누고, 달리세요</p>
+        </div>
+
+        {/* Tab */}
+        <div className="w-full flex bg-dark-700 rounded-xl p-1 mb-6">
+          {[['login','로그인'],['register','회원가입']].map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)}
+              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${tab===id ? 'bg-neon text-dark-900' : 'text-gray-400'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="w-full space-y-3">
+          {tab === 'register' && (
+            <input className={inputCls} placeholder="닉네임" value={form.nickname}
+              onChange={e => set('nickname', e.target.value)} />
+          )}
+          <input className={inputCls} placeholder="이메일" type="email" value={form.email}
+            onChange={e => set('email', e.target.value)} />
+          <input className={inputCls} placeholder="비밀번호" type="password" value={form.password}
+            onChange={e => set('password', e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && (tab==='login' ? handleLogin() : handleRegister())} />
+
+          <button
+            onClick={tab === 'login' ? handleLogin : handleRegister}
+            disabled={loading}
+            className="w-full bg-neon text-dark-900 font-bold rounded-xl py-3 text-sm mt-2 disabled:opacity-50 active:opacity-80">
+            {loading ? '처리 중...' : tab === 'login' ? '로그인' : '시작하기'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     TAB 1 — Map Tab : 내 위치 + 현재 유저 마커
+  ══════════════════════════════════════════ */
+  function MapTab({ member }) {
+    const [center, setCenter]   = useState({ lat: 37.5665, lng: 126.9780 });
+    const [mapObj, setMapObj]   = useState(null);
+    const [mapsApi, setMapsApi] = useState(null);
+    const overlayRef            = useRef(null);
+
+    // GPS 위치 획득
+    useEffect(() => {
+      navigator.geolocation?.getCurrentPosition(
+        pos => setCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => {}
+      );
+    }, []);
+
+    // 내 마커 렌더링
+    useEffect(() => {
+      if (!mapObj || !mapsApi) return;
+      if (overlayRef.current) overlayRef.current.setMap(null);
+
+      const content = `
+        <div style="position:relative;text-align:center">
+          <div style="position:absolute;top:-22px;left:50%;transform:translateX(-50%);
+            background:#222;border:1px solid #39FF14;color:#39FF14;border-radius:8px;
+            padding:1px 6px;font-size:10px;white-space:nowrap">${member.nickname}</div>
+          <div style="width:14px;height:14px;background:#39FF14;border:2px solid #fff;border-radius:50%"></div>
+        </div>`;
+      const overlay = new mapsApi.CustomOverlay({
+        position: new mapsApi.LatLng(center.lat, center.lng),
+        content, yAnchor: 1,
+      });
+      overlay.setMap(mapObj);
+      overlayRef.current = overlay;
+      mapObj.setCenter(new mapsApi.LatLng(center.lat, center.lng));
+      return () => overlay.setMap(null);
+    }, [mapObj, mapsApi, center, member.nickname]);
+
+    return (
+      <div className="fade-enter flex flex-col h-full">
+        <div className="flex-1 relative">
+          <MapComponent mapId="map-main" center={center}
+            style={{ width:'100%', height:'100%' }}
+            onMapReady={(m, maps) => { setMapObj(m); setMapsApi(maps); }} />
+          {/* 내 정보 배지 */}
+          <div className="absolute bottom-4 left-3 right-3 bg-dark-800 bg-opacity-90 border border-dark-500 rounded-xl p-3 flex items-center gap-3">
+            <div className="w-9 h-9 rounded-full bg-dark-600 border border-neon flex items-center justify-center text-lg flex-shrink-0">🏃</div>
+            <div>
+              <p className="text-white text-sm font-semibold">{member.nickname}</p>
+              <p className="text-gray-500 text-xs">총 {member.totalDistance?.toFixed(1) ?? '0.0'}km 달성</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     TAB 2 — Draw Course Tab (핵심 기능)
+     지도를 클릭해 웨이포인트 추가 → 폴리라인 실시간 렌더
+     저장 시 POST /api/v1/courses
+  ══════════════════════════════════════════ */
+  function DrawCourseTab({ member, onCourseSaved, showToast }) {
+    const [draft, setDraft]     = useState({ name:'', region:'', waypoints:[], distance:0 });
+    const [mapObj, setMapObj]   = useState(null);
+    const [mapsApi, setMapsApi] = useState(null);
+    const [saving, setSaving]   = useState(false);
+    const markersRef            = useRef([]);
+    const polylineRef           = useRef(null);
+
+    // waypoints 변경 시마다 마커 + 폴리라인 재렌더
+    useEffect(() => {
+      if (!mapObj || !mapsApi) return;
+      markersRef.current.forEach(m => m.setMap(null));
+      markersRef.current = [];
+      if (polylineRef.current) { polylineRef.current.setMap(null); polylineRef.current = null; }
+      if (draft.waypoints.length === 0) return;
+
+      // 웨이포인트 마커 (시작점은 neon, 나머지는 흰색)
+      draft.waypoints.forEach((wp, idx) => {
+        const el = `<div style="width:10px;height:10px;background:${idx===0?'#39FF14':'#fff'};
+          border:2px solid #39FF14;border-radius:50%;margin:-5px 0 0 -5px"></div>`;
+        const ov = new mapsApi.CustomOverlay({
+          position: new mapsApi.LatLng(wp.lat, wp.lng), content: el, zIndex: 1,
+        });
+        ov.setMap(mapObj);
+        markersRef.current.push(ov);
+      });
+
+      // 폴리라인 — 모든 웨이포인트를 잇는 초록 선
+      if (draft.waypoints.length >= 2) {
+        const path = draft.waypoints.map(wp => new mapsApi.LatLng(wp.lat, wp.lng));
+        const pl   = new mapsApi.Polyline({ path, strokeWeight:3, strokeColor:'#39FF14', strokeOpacity:0.9, strokeStyle:'solid' });
+        pl.setMap(mapObj);
+        polylineRef.current = pl;
+      }
+    }, [draft.waypoints, mapObj, mapsApi]);
+
+    // 지도 클릭 → 좌표 추가 → 거리 자동 계산
+    const handleMapClick = useCallback((coord) => {
+      setDraft(prev => {
+        const waypoints = [...prev.waypoints, coord];
+        return { ...prev, waypoints, distance: calcTotalDistance(waypoints) };
+      });
+    }, []);
+
+    // 초기화 — 마커/폴리라인 제거 + 드래프트 초기화
+    const handleReset = () => {
+      markersRef.current.forEach(m => m.setMap(null));
+      markersRef.current = [];
+      if (polylineRef.current) { polylineRef.current.setMap(null); polylineRef.current = null; }
+      setDraft({ name:'', region:'', waypoints:[], distance:0 });
+    };
+
+    // 저장 — 유효성 검사 후 POST /api/v1/courses
+    const handleSave = async () => {
+      if (!draft.name.trim())           { showToast('코스 이름을 입력하세요'); return; }
+      if (!draft.region.trim())         { showToast('지역을 입력하세요'); return; }
+      if (draft.waypoints.length < 2)   { showToast('최소 2개 이상의 포인트를 찍어주세요'); return; }
+      setSaving(true);
+      try {
+        await api.saveCourse({
+          name:            draft.name,
+          region:          draft.region,
+          memberId:        member.id,
+          creatorNickname: member.nickname,
+          distance:        draft.distance,
+          // 프론트 {lat,lng} → 백엔드 {latitude, longitude, sequence}
+          waypoints: draft.waypoints.map((wp, i) => ({
+            latitude:  wp.lat,
+            longitude: wp.lng,
+            sequence:  i,
+          })),
+        });
+        handleReset();
+        onCourseSaved();
+        showToast('코스가 저장되었습니다 🏃');
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        setSaving(false);
+      }
+    };
+
+    return (
+      <div className="fade-enter flex flex-col h-full">
+        <div className="relative" style={{ height:'55%' }}>
+          <MapComponent mapId="map-draw" center={{ lat:37.5665, lng:126.9780 }}
+            onMapClick={handleMapClick} style={{ width:'100%', height:'100%' }}
+            onMapReady={(m, maps) => { setMapObj(m); setMapsApi(maps); }} />
+          <div className="absolute top-2 left-2 bg-dark-800 bg-opacity-90 rounded-lg px-2 py-1">
+            <span className="text-neon text-xs font-medium">지도를 탭하여 코스를 그리세요</span>
+          </div>
+        </div>
+
+        <div className="flex-1 bg-dark-800 p-4 overflow-y-auto">
+          {/* 거리 / 포인트 수 */}
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="bg-dark-700 rounded-xl p-3 text-center">
+              <p className="text-2xl font-bold text-neon">{draft.waypoints.length}</p>
+              <p className="text-xs text-gray-400 mt-1">포인트</p>
+            </div>
+            <div className="bg-dark-700 rounded-xl p-3 text-center">
+              <p className="text-2xl font-bold text-neon">{draft.distance.toFixed(1)}</p>
+              <p className="text-xs text-gray-400 mt-1">km</p>
+            </div>
+          </div>
+
+          {/* 코스 정보 입력 */}
+          <div className="space-y-3 mb-4">
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">코스 이름</label>
+              <input className="w-full bg-dark-700 border border-dark-500 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-neon"
+                placeholder="코스 이름을 입력하세요" value={draft.name}
+                onChange={e => setDraft(d => ({ ...d, name: e.target.value }))} />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">지역</label>
+              <input className="w-full bg-dark-700 border border-dark-500 rounded-xl px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-neon"
+                placeholder="예: 서울, 한강, 남산" value={draft.region}
+                onChange={e => setDraft(d => ({ ...d, region: e.target.value }))} />
+            </div>
+          </div>
+
+          <div className="flex gap-3">
+            <button onClick={handleReset}
+              className="flex-1 bg-dark-600 border border-dark-500 text-gray-300 rounded-xl py-3 text-sm font-medium active:opacity-70">
+              초기화
+            </button>
+            <button onClick={handleSave} disabled={saving}
+              className="flex-1 bg-neon text-dark-900 rounded-xl py-3 text-sm font-bold active:opacity-70 disabled:opacity-50">
+              {saving ? '저장 중...' : '코스 저장'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     CourseCard — 랭킹 탭에서 사용
+     클릭 시 폴리라인 미리보기 맵 표시
+  ══════════════════════════════════════════ */
+  function CourseCard({ course, onLike, showToast }) {
+    const [expanded, setExpanded] = useState(false);
+    const [mapObj, setMapObj]     = useState(null);
+    const [mapsApi, setMapsApi]   = useState(null);
+    const polylineRef             = useRef(null);
+
+    // 카드 펼칠 때 폴리라인 그리기
+    useEffect(() => {
+      if (!expanded || !mapObj || !mapsApi) return;
+      if (polylineRef.current) polylineRef.current.setMap(null);
+      // 백엔드 응답 {latitude, longitude} → 카카오 LatLng
+      if (course.waypoints.length < 2) return;
+      const path = course.waypoints.map(wp => new mapsApi.LatLng(wp.latitude, wp.longitude));
+      const pl   = new mapsApi.Polyline({ path, strokeWeight:3, strokeColor:'#39FF14', strokeOpacity:0.9, strokeStyle:'solid' });
+      pl.setMap(mapObj);
+      polylineRef.current = pl;
+      mapObj.setCenter(new mapsApi.LatLng(course.waypoints[0].latitude, course.waypoints[0].longitude));
+    }, [expanded, mapObj, mapsApi]);
+
+    const handleLike = (e) => {
+      e.stopPropagation();
+      onLike(course.id);
+      showToast('좋아요를 눌렀습니다 ❤️');
+    };
+
+    return (
+      <div className="bg-dark-700 rounded-xl mb-3 overflow-hidden">
+        <div className="p-4 flex items-center cursor-pointer" onClick={() => setExpanded(!expanded)}>
+          <div className="flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-white font-medium text-sm">{course.name}</span>
+              <span className="text-xs bg-dark-600 text-gray-400 px-2 py-0.5 rounded-full">{course.region}</span>
+            </div>
+            <p className="text-xs text-gray-500">{course.creatorNickname} · {course.distance.toFixed(1)}km</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={handleLike}
+              className="flex items-center gap-1 bg-dark-600 rounded-full px-3 py-1.5 active:opacity-70">
+              <span className="text-red-400 text-sm">♥</span>
+              <span className="text-xs text-gray-300">{course.likes}</span>
+            </button>
+            <span className="text-gray-500 text-sm">{expanded ? '▲' : '▼'}</span>
+          </div>
+        </div>
+
+        {/* 코스 폴리라인 미리보기 맵 */}
+        {expanded && (
+          <div style={{ height:200 }}>
+            {course.waypoints.length >= 2 ? (
+              <MapComponent
+                mapId={`map-preview-${course.id}`}
+                center={{ lat: course.waypoints[0].latitude, lng: course.waypoints[0].longitude }}
+                style={{ width:'100%', height:'100%' }}
+                onMapReady={(m, maps) => { setMapObj(m); setMapsApi(maps); }} />
+            ) : (
+              <div className="w-full h-full bg-dark-600 flex items-center justify-center">
+                <p className="text-gray-500 text-xs">경로 정보 없음</p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     TAB 3 — Ranking Tab
+     GET /api/v1/courses (지역 필터 가능)
+     POST /api/v1/courses/{id}/likes — 좋아요
+  ══════════════════════════════════════════ */
+  function RankingTab({ showToast }) {
+    const [courses, setCourses]         = useState([]);
+    const [regionFilter, setRegionFilter] = useState('전체');
+    const [loading, setLoading]         = useState(false);
+
+    const fetchCourses = async (region) => {
+      setLoading(true);
+      try {
+        const data = await api.getCourses(region === '전체' ? null : region);
+        setCourses(data);
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    useEffect(() => { fetchCourses(regionFilter); }, [regionFilter]);
+
+    const handleLike = async (id) => {
+      try {
+        await api.likeCourse(id);
+        // 낙관적 UI 업데이트 — 서버 반영 확인 후 리스트 갱신
+        setCourses(prev => prev.map(c => c.id === id ? { ...c, likes: c.likes + 1 } : c));
+      } catch (e) {
+        showToast(e.message);
+      }
+    };
+
+    const regions = ['전체', ...new Set(courses.map(c => c.region).filter(Boolean))];
+
+    return (
+      <div className="fade-enter flex flex-col h-full">
+        <div className="p-4 bg-dark-800 border-b border-dark-600">
+          <h2 className="text-neon font-bold text-lg mb-3">코스 랭킹</h2>
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {regions.map(r => (
+              <button key={r} onClick={() => setRegionFilter(r)}
+                className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${regionFilter===r ? 'bg-neon text-dark-900' : 'bg-dark-700 text-gray-400'}`}>
+                {r}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4">
+          {loading ? <Spinner /> : courses.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full text-center">
+              <div className="text-4xl mb-3">🏃</div>
+              <p className="text-gray-500 text-sm">저장된 코스가 없습니다</p>
+              <p className="text-gray-600 text-xs mt-1">코스 그리기 탭에서 첫 코스를 만들어보세요!</p>
+            </div>
+          ) : [...courses].sort((a,b) => b.likes - a.likes).map((course, idx) => (
+            <div key={course.id} className="flex items-start gap-3 mb-2">
+              <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold mt-3"
+                style={{ background: idx===0?'#FFD700':idx===1?'#C0C0C0':idx===2?'#CD7F32':'#2a2a2a', color: idx<3?'#111':'#666' }}>
+                {idx + 1}
+              </div>
+              <div className="flex-1">
+                <CourseCard course={course} onLike={handleLike} showToast={showToast} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     TAB 4 — Profile Tab
+     GET /api/v1/members/{id}
+     GET /api/v1/courses/members/{id}
+     PUT /api/v1/members/{id} — 닉네임 변경
+  ══════════════════════════════════════════ */
+  function ProfileTab({ member, onMemberUpdate, showToast }) {
+    const [myCourses, setMyCourses]   = useState([]);
+    const [loading, setLoading]       = useState(false);
+    const [editingName, setEditingName] = useState(false);
+    const [nameInput, setNameInput]   = useState(member.nickname);
+    const [savingName, setSavingName] = useState(false);
+
+    useEffect(() => {
+      setLoading(true);
+      api.getMyCourses(member.id)
+        .then(setMyCourses)
+        .catch(e => showToast(e.message))
+        .finally(() => setLoading(false));
+    }, [member.id]);
+
+    const medals = calcMedals(member, myCourses);
+
+    const handleSaveName = async () => {
+      if (!nameInput.trim()) return;
+      setSavingName(true);
+      try {
+        await api.updateNickname(member.id, nameInput.trim());
+        onMemberUpdate({ ...member, nickname: nameInput.trim() });
+        setEditingName(false);
+        showToast('닉네임이 변경됐습니다');
+      } catch (e) {
+        showToast(e.message);
+      } finally {
+        setSavingName(false);
+      }
+    };
+
+    return (
+      <div className="fade-enter flex flex-col h-full overflow-y-auto">
+        {/* 헤더 — 프로필 + 통계 */}
+        <div className="p-6 bg-dark-800 border-b border-dark-600">
+          <div className="flex items-center gap-4">
+            <div className="w-16 h-16 rounded-full bg-dark-600 border-2 border-neon flex items-center justify-center text-2xl">🏃</div>
+            <div className="flex-1">
+              {editingName ? (
+                <div className="flex gap-2">
+                  <input autoFocus
+                    className="flex-1 bg-dark-700 border border-neon rounded-lg px-2 py-1 text-white text-sm focus:outline-none"
+                    value={nameInput}
+                    onChange={e => setNameInput(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleSaveName()} />
+                  <button onClick={handleSaveName} disabled={savingName}
+                    className="text-neon text-xs disabled:opacity-50">저장</button>
+                  <button onClick={() => setEditingName(false)} className="text-gray-500 text-xs">취소</button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <h2 className="text-white font-bold text-xl">{member.nickname}</h2>
+                  <button onClick={() => { setNameInput(member.nickname); setEditingName(true); }}
+                    className="text-gray-500 text-xs">✏️</button>
+                </div>
+              )}
+              <p className="text-gray-500 text-xs mt-1">{member.email}</p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3 mt-4">
+            {[
+              { label:'총 거리', value:`${(member.totalDistance??0).toFixed(1)}km` },
+              { label:'코스 수', value: loading ? '...' : myCourses.length },
+              { label:'메달',   value: medals.length },
+            ].map(({ label, value }) => (
+              <div key={label} className="bg-dark-700 rounded-xl p-3 text-center">
+                <p className="text-neon font-bold text-lg">{value}</p>
+                <p className="text-gray-500 text-xs mt-0.5">{label}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* 메달 섹션 — 조건 충족 시 자동 표시 */}
+        <div className="p-4 border-b border-dark-600">
+          <h3 className="text-white font-semibold text-sm mb-3">🏅 획득한 메달</h3>
+          {medals.length === 0 ? (
+            <div className="bg-dark-700 rounded-xl p-4 text-center">
+              <p className="text-gray-500 text-xs">아직 메달이 없습니다</p>
+              <p className="text-gray-600 text-xs mt-1">10km 달리면 첫 메달을 획득해요!</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-2">
+              {medals.map(medal => (
+                <div key={medal.id} className="bg-dark-700 border border-dark-500 rounded-xl p-3 flex items-center gap-3">
+                  <span className="text-2xl">{medal.icon}</span>
+                  <div>
+                    <p className="text-white text-xs font-medium">{medal.name}</p>
+                    <p className="text-gray-500 text-xs">{medal.desc}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* 내가 만든 코스 */}
+        <div className="p-4">
+          <h3 className="text-white font-semibold text-sm mb-3">🗺️ 내가 만든 코스</h3>
+          {loading ? <Spinner /> : myCourses.length === 0 ? (
+            <div className="bg-dark-700 rounded-xl p-4 text-center">
+              <p className="text-gray-500 text-xs">만든 코스가 없습니다</p>
+            </div>
+          ) : myCourses.map(course => (
+            <div key={course.id} className="bg-dark-700 rounded-xl p-3 mb-2 flex justify-between items-center">
+              <div>
+                <p className="text-white text-sm font-medium">{course.name}</p>
+                <p className="text-gray-500 text-xs">{course.region} · {course.distance.toFixed(1)}km</p>
+              </div>
+              <div className="flex items-center gap-1 text-red-400 text-xs">
+                <span>♥</span><span>{course.likes}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     Bottom Tab Navigation
+  ══════════════════════════════════════════ */
+  const TABS = [
+    { id:'map',     label:'지도',       icon:'🗺️' },
+    { id:'draw',    label:'코스 그리기', icon:'✏️' },
+    { id:'ranking', label:'랭킹',       icon:'🏆' },
+    { id:'profile', label:'프로필',     icon:'👤' },
+  ];
+
+  function BottomTabs({ active, onChange }) {
+    return (
+      <div className="flex bg-dark-800 border-t border-dark-600">
+        {TABS.map(tab => (
+          <button key={tab.id} onClick={() => onChange(tab.id)}
+            className={`flex-1 flex flex-col items-center py-3 gap-0.5 transition-colors ${active===tab.id ? 'text-neon' : 'text-gray-600'}`}>
+            <span className="text-lg leading-none">{tab.icon}</span>
+            <span className="text-xs font-medium">{tab.label}</span>
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════
+     App Root
+  ══════════════════════════════════════════ */
+  function App() {
+    const [member, setMember]   = useState(null);   // 로그인한 회원 정보
+    const [activeTab, setTab]   = useState('map');
+    const [toast, setToast]     = useState(null);
+    const [courseSaved, setCourseSaved] = useState(0); // 코스 저장 시 랭킹 탭 갱신 트리거
+
+    const showToast = (msg) => { setToast(null); setTimeout(() => setToast(msg), 10); };
+
+    // 로그인/회원가입 완료
+    const handleAuth = (m) => setMember(m);
+
+    // 코스 저장 후 멤버 정보 새로고침 (totalDistance 반영)
+    const handleCourseSaved = async () => {
+      setCourseSaved(n => n + 1);
+      try {
+        const updated = await api.getMe(member.id);
+        setMember(updated);
+      } catch (_) {}
+    };
+
+    // 비로그인 — 인증 화면
+    if (!member) {
+      return (
+        <div style={{ height:'100dvh', maxWidth:430, margin:'0 auto' }}>
+          <AuthScreen onAuth={handleAuth} showToast={showToast} />
+          {toast && <Toast message={toast} onDone={() => setToast(null)} />}
+        </div>
+      );
+    }
+
+    const tabContent = {
+      map:     <MapTab member={member} />,
+      draw:    <DrawCourseTab member={member} onCourseSaved={handleCourseSaved} showToast={showToast} />,
+      ranking: <RankingTab key={courseSaved} showToast={showToast} />,
+      profile: <ProfileTab member={member} onMemberUpdate={setMember} showToast={showToast} />,
+    };
+
+    return (
+      <div className="flex flex-col bg-dark-900" style={{ height:'100dvh', maxWidth:430, margin:'0 auto' }}>
+        <div className="flex-1 overflow-hidden" style={{ position:'relative' }}>
+          {tabContent[activeTab]}
+        </div>
+        <BottomTabs active={activeTab} onChange={setTab} />
+        {toast && <Toast message={toast} onDone={() => setToast(null)} />}
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

@@ -36,4 +36,10 @@ build/
 /bin1/
 java/build/**
 
-.claude
+# Gradle
+.gradle/
+
+# Spring - 환경별 설정 파일
+application-*.properties
+
+.claude/
